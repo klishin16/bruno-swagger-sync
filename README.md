@@ -66,6 +66,16 @@ New files are always added automatically. Deleted files (removed from spec) prom
 
 Collection headers configured in Bruno are preserved by default. Pass `--sync-collection-headers` to replace them with headers from the imported collection instead. If the import has no collection headers, this flag allows existing collection headers to be removed. Changes still follow the usual diff and confirmation flow (`--yes` accepts them automatically). Request-level headers sync as usual.
 
+Collection variables configured in Bruno are always preserved, including when `--sync-collection-headers` is enabled. This applies to `request.variables` in OpenCollection YAML and the `vars:pre-request` / `vars:post-response` blocks in `collection.bru`.
+
+Collection authentication is also always preserved, including its mode, credentials, and OAuth2 parameters. This applies to `request.auth` in OpenCollection YAML and all `auth` / `auth:*` blocks in `collection.bru`. If an existing collection has no authentication configured, imported authentication is removed. New collections use authentication from the import.
+
+Existing JSON request bodies keep filled values (including `0` and `false`), nested object fields, and non-empty arrays. New fields are added from the import; `null`, empty strings, and empty arrays use imported values. Existing custom object fields are kept. This applies when both versions have a JSON body, in OpenCollection YAML or `.bru` files. Invalid JSON stops the sync before collection files are changed.
+
+Filled query and path parameter values are preserved by matching parameter name and type, including `0`, `false`, and variable references. New parameters and other parameter settings come from the import; parameters removed from the spec are removed. Empty values use imported defaults. This applies to `http.params` in OpenCollection YAML and `params:query`, `params:path`, and legacy `query` blocks in `.bru` files.
+
+Existing `auth: inherit` settings are preserved when syncing OpenCollection YAML and `.bru` requests, so imported authentication does not override inheritance. Other request authentication modes sync as usual.
+
 Sync preserves existing folder names when they differ from imported names only by spaces versus underscores (for example, `Admin merchant management` and `Admin_merchant_management`). New folders use spaces instead of underscores; existing folders are never renamed. Exact names take priority; ambiguous matches stop the sync before collection files are changed.
 
 ## Programmatic API

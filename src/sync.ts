@@ -4,7 +4,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { isDeepStrictEqual } from 'node:util';
-import { isMap, parseDocument } from 'yaml';
+import { isMap, isSeq, parseDocument } from 'yaml';
 
 export interface SyncOptions {
   source: string;
@@ -13,16 +13,201 @@ export interface SyncOptions {
   syncCollectionHeaders?: boolean;
 }
 
-function preserveCollectionHeaders(existingFile: string, importedFile: string): void {
+function mergeJsonBody(existing: unknown, imported: unknown): unknown {
+  if (existing === null || existing === undefined || existing === '') return imported;
+  if (Array.isArray(existing)) return existing.length ? existing : imported;
+  if (typeof existing === 'object') {
+    if (imported === null || typeof imported !== 'object' || Array.isArray(imported)) {
+      return Object.keys(existing).length ? existing : imported;
+    }
+    const merged = new Map(Object.entries(imported));
+    for (const [key, value] of Object.entries(existing)) {
+      const preserved = mergeJsonBody(value, merged.get(key));
+      if (preserved !== undefined) merged.set(key, preserved);
+    }
+    return Object.fromEntries(merged);
+  }
+  return existing;
+}
+
+function preserveJsonBody(existingFile: string, importedFile: string): void {
+  const extension = path.extname(importedFile);
+  if (!['.bru', '.yml', '.yaml'].includes(extension)) return;
+  const existingContent = fs.readFileSync(existingFile, 'utf-8');
+  const importedContent = fs.readFileSync(importedFile, 'utf-8');
+
+  function mergeData(existingData: string, importedData: string): string {
+    try {
+      const existing = JSON.parse(existingData);
+      const imported = JSON.parse(importedData);
+      const merged = mergeJsonBody(existing, imported);
+      if (isDeepStrictEqual(merged, existing)) return existingData;
+      if (isDeepStrictEqual(merged, imported)) return importedData;
+      return JSON.stringify(merged, null, 2);
+    } catch {
+      throw new Error(`Cannot preserve JSON body in ${existingFile}: body must contain valid JSON`);
+    }
+  }
+
+  if (extension === '.bru') {
+    const bodyBlock = /^body:json\s*\{\r?\n([\s\S]*?)^\}/m;
+    const existingBody = existingContent.match(bodyBlock);
+    const importedBody = importedContent.match(bodyBlock);
+    if (!existingBody || !importedBody) return;
+    const merged = mergeData(existingBody[1], importedBody[1]);
+    const block = merged === existingBody[1] ? existingBody[0]
+      : merged === importedBody[1] ? importedBody[0]
+        : `body:json {\n${merged.split('\n').map((line) => `  ${line}`).join('\n')}\n}`;
+    fs.writeFileSync(importedFile, importedContent.replace(bodyBlock, () => block));
+    return;
+  }
+
+  const existing = parseDocument(existingContent);
+  const imported = parseDocument(importedContent);
+  if (existing.errors.length || imported.errors.length) {
+    throw new Error(`Cannot read request body in ${existingFile}: invalid YAML`);
+  }
+  if (existing.getIn(['http', 'body', 'type']) !== 'json'
+    || imported.getIn(['http', 'body', 'type']) !== 'json') return;
+  const dataPath = ['http', 'body', 'data'];
+  const existingData = existing.getIn(dataPath);
+  const importedData = imported.getIn(dataPath);
+  if (typeof existingData !== 'string' || typeof importedData !== 'string') return;
+  const merged = mergeData(existingData, importedData);
+  if (merged === importedData) return;
+  imported.setIn(dataPath, merged);
+  fs.writeFileSync(importedFile, isDeepStrictEqual(existing.toJS(), imported.toJS())
+    ? existingContent : imported.toString());
+}
+
+function preserveParamValues(existingFile: string, importedFile: string): void {
+  const extension = path.extname(importedFile);
+  if (!['.bru', '.yml', '.yaml'].includes(extension)) return;
+  const existingContent = fs.readFileSync(existingFile, 'utf-8');
+  const importedContent = fs.readFileSync(importedFile, 'utf-8');
+  const values = new Map<string, unknown[]>();
+  const paramKey = (type: string, name: string): string => JSON.stringify([type, name]);
+  const remember = (key: string, value: unknown): void => {
+    const entries = values.get(key) ?? [];
+    entries.push(value);
+    values.set(key, entries);
+  };
+
+  if (extension === '.bru') {
+    const blocks = /^(params:query|params:path|query)\s*\{\r?\n([\s\S]*?)^\}/gm;
+    // Keep the imported key and enabled state; replace only its value.
+    const entries = /^([ \t]*~?("(?:\\.|[^"\\])*"|[^:\s][^:\r\n]*?)[ \t]*:[ \t]*)('''[\s\S]*?'''|[^\r\n]*)/gm;
+    const keyFor = (block: string, name: string): string => paramKey(
+      block === 'params:path' ? 'path' : 'query',
+      name.startsWith('"') ? JSON.parse(name) : name.trim(),
+    );
+    for (const [, block, content] of existingContent.matchAll(blocks)) {
+      for (const [, , name, value] of content.matchAll(entries)) {
+        remember(keyFor(block, name), value);
+      }
+    }
+    const content = importedContent.replace(blocks, (whole, block: string, body: string) => {
+      const merged = body.replace(entries, (entry, prefix: string, name: string) => {
+        const value = values.get(keyFor(block, name))?.shift();
+        if (typeof value !== 'string') return entry;
+        const filled = value.startsWith("'''") ? value.slice(3, -3).trim() : value.trim();
+        return filled ? `${prefix}${value}` : entry;
+      });
+      return whole.replace(body, () => merged);
+    });
+    if (content !== importedContent) fs.writeFileSync(importedFile, content);
+    return;
+  }
+
+  const existing = parseDocument(existingContent);
+  const imported = parseDocument(importedContent);
+  if (existing.errors.length || imported.errors.length) {
+    throw new Error(`Cannot read parameters in ${existingFile}: invalid YAML`);
+  }
+  const existingParams = existing.getIn(['http', 'params']);
+  const importedParams = imported.getIn(['http', 'params']);
+  if (!isSeq(existingParams) || !isSeq(importedParams)) return;
+  for (const param of existingParams.items) {
+    if (!isMap(param) || typeof param.get('name') !== 'string') continue;
+    remember(paramKey(String(param.get('type') ?? 'query'), param.get('name') as string), param.get('value'));
+  }
+  let changed = false;
+  for (const param of importedParams.items) {
+    if (!isMap(param) || typeof param.get('name') !== 'string') continue;
+    const value = values.get(paramKey(String(param.get('type') ?? 'query'), param.get('name') as string))?.shift();
+    if ((typeof value !== 'string' || !value.trim()) && typeof value !== 'number' && typeof value !== 'boolean') continue;
+    if (isDeepStrictEqual(value, param.get('value'))) continue;
+    param.set('value', value);
+    changed = true;
+  }
+  if (changed) {
+    fs.writeFileSync(importedFile, isDeepStrictEqual(existing.toJS(), imported.toJS())
+      ? existingContent : imported.toString());
+  }
+}
+
+function preserveInheritedAuth(existingFile: string, importedFile: string): void {
+  const extension = path.extname(importedFile);
+  if (!['.bru', '.yml', '.yaml'].includes(extension)) return;
+  const existingContent = fs.readFileSync(existingFile, 'utf-8');
+  const importedContent = fs.readFileSync(importedFile, 'utf-8');
+
+  if (extension === '.bru') {
+    const requestBlock = /^(?:get|post|put|patch|delete|head|options|trace|connect|http|grpc|ws)\s*\{\r?\n[\s\S]*?^\}/gm;
+    const inherited = [...existingContent.matchAll(requestBlock)]
+      .some(([block]) => /^\s*auth:\s*inherit\s*$/m.test(block));
+    if (!inherited || !requestBlock.test(importedContent)) return;
+    requestBlock.lastIndex = 0;
+    const content = importedContent.replace(requestBlock, (block) => {
+      const authLine = /^[ \t]*auth:[^\r\n]*/m;
+      return authLine.test(block)
+        ? block.replace(authLine, '  auth: inherit')
+        : block.replace(/^\}/m, '  auth: inherit\n}');
+    }).replace(/^auth:[\w-]+\s*\{\r?\n[\s\S]*?^\}\r?\n?/gm, '');
+    fs.writeFileSync(importedFile, content);
+    return;
+  }
+
+  const existing = parseDocument(existingContent);
+  const imported = parseDocument(importedContent);
+  if (existing.errors.length || imported.errors.length) {
+    throw new Error(`Cannot read authentication in ${existingFile}: invalid YAML`);
+  }
+  let changed = false;
+  for (const section of ['http', 'request', 'grpc', 'websocket']) {
+    const authPath = [section, 'auth'];
+    if (existing.getIn(authPath) === 'inherit' && (section === 'request' || imported.has(section))
+      && imported.getIn(authPath) !== 'inherit') {
+      imported.setIn(authPath, 'inherit');
+      changed = true;
+    }
+  }
+  if (changed) {
+    fs.writeFileSync(importedFile, isDeepStrictEqual(existing.toJS(), imported.toJS())
+      ? existingContent : imported.toString());
+  }
+}
+
+function preserveCollectionSettings(existingFile: string, importedFile: string, syncHeaders: boolean): void {
   const existingContent = fs.readFileSync(existingFile, 'utf-8');
   const importedContent = fs.readFileSync(importedFile, 'utf-8');
   if (path.basename(importedFile) === 'collection.bru') {
-    const headersBlock = /^headers\s*\{\r?\n[\s\S]*?^\}/m;
-    const existingHeaders = existingContent.match(headersBlock)?.[0];
-    const content = importedContent.replace(headersBlock, () => existingHeaders ?? '');
-    fs.writeFileSync(importedFile, existingHeaders && !headersBlock.test(importedContent)
-      ? `${content.trimEnd()}\n\n${existingHeaders}\n`
-      : content);
+    const blocks = ['vars:pre-request', 'vars:post-response'];
+    if (!syncHeaders) blocks.push('headers');
+    const authBlocks = /^auth(?::[\w:-]+)?(?=\s*\{)/gm;
+    blocks.push(...new Set([
+      ...(existingContent.match(authBlocks) ?? []),
+      ...(importedContent.match(authBlocks) ?? []),
+    ]));
+    let content = importedContent;
+    for (const name of blocks) {
+      const block = new RegExp(`^${name}\\s*\\{\\r?\\n[\\s\\S]*?^\\}`, 'm');
+      const existingBlock = existingContent.match(block)?.[0];
+      const hasBlock = block.test(content);
+      content = content.replace(block, () => existingBlock ?? '');
+      if (existingBlock && !hasBlock) content = `${content.trimEnd()}\n\n${existingBlock}\n`;
+    }
+    fs.writeFileSync(importedFile, content);
     return;
   }
 
@@ -30,20 +215,26 @@ function preserveCollectionHeaders(existingFile: string, importedFile: string): 
   const imported = parseDocument(importedContent);
   for (const [document, file] of [[existing, existingFile], [imported, importedFile]] as const) {
     if (document.errors.length) {
-      throw new Error(`Cannot read collection headers in ${file}: ${document.errors[0].message}`);
+      throw new Error(`Cannot read collection settings in ${file}: ${document.errors[0].message}`);
     }
   }
 
-  const headersPath = ['request', 'headers'];
-  if (isDeepStrictEqual(existing.toJS()?.request?.headers, imported.toJS()?.request?.headers)) return;
-
-  if (existing.hasIn(headersPath)) {
-    imported.setIn(headersPath, imported.createNode(existing.toJS().request.headers));
-  } else {
-    imported.deleteIn(headersPath);
-    const request = imported.get('request', true);
-    if (isMap(request) && request.items.length === 0) imported.delete('request');
+  const fields = ['variables', 'auth'];
+  if (!syncHeaders) fields.push('headers');
+  let changed = false;
+  for (const field of fields) {
+    const fieldPath = ['request', field];
+    if (isDeepStrictEqual(existing.toJS()?.request?.[field], imported.toJS()?.request?.[field])) continue;
+    changed = true;
+    if (existing.hasIn(fieldPath)) {
+      imported.setIn(fieldPath, imported.createNode(existing.toJS().request[field]));
+    } else {
+      imported.deleteIn(fieldPath);
+      const request = imported.get('request', true);
+      if (isMap(request) && request.items.length === 0) imported.delete('request');
+    }
   }
+  if (!changed) return;
 
   // Avoid prompting for a change caused solely by YAML formatting.
   fs.writeFileSync(importedFile, isDeepStrictEqual(existing.toJS(), imported.toJS())
@@ -230,13 +421,20 @@ export async function sync(options: SyncOptions): Promise<void> {
       }
     }
 
-    if (!syncCollectionHeaders) {
-      for (const name of ['opencollection.yml', 'opencollection.yaml', 'collection.bru']) {
-        const importedFile = path.join(tmpRoot, name);
-        const existingFile = path.join(outputRoot, name);
-        if (fs.existsSync(importedFile) && fs.existsSync(existingFile)) {
-          preserveCollectionHeaders(existingFile, importedFile);
-        }
+    for (const name of ['opencollection.yml', 'opencollection.yaml', 'collection.bru']) {
+      const importedFile = path.join(tmpRoot, name);
+      const existingFile = path.join(outputRoot, name);
+      if (fs.existsSync(importedFile) && fs.existsSync(existingFile)) {
+        preserveCollectionSettings(existingFile, importedFile, syncCollectionHeaders);
+      }
+    }
+
+    for (const tmpFile of tmpFiles) {
+      const existingFile = targetFile(tmpFile);
+      if (fs.existsSync(existingFile)) {
+        preserveJsonBody(existingFile, tmpFile);
+        preserveParamValues(existingFile, tmpFile);
+        preserveInheritedAuth(existingFile, tmpFile);
       }
     }
 
